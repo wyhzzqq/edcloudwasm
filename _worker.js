@@ -858,6 +858,39 @@ const manualPipe = async (readable, writable, close) => {
         }
     } catch {close?.(), isClose = true} finally {isReading = false, flushBuffer()}
 };
+const createBufferedTcpWriter = (tcpWriter, close) => {
+    let buffer = new Uint8Array(maxChunkLen), offset = 0, timerId = null, isClosed = false;
+    const write = (chunk) => {
+        if (isClosed) return;
+        tcpWriter.write(chunk).catch(() => {
+            isClosed = true, close?.();
+        });
+    };
+    const flush = () => {
+        timerId && (clearTimeout(timerId), timerId = null);
+        if (isClosed) return offset = 0;
+        if (!offset) return;
+        const chunk = offset === buffer.byteLength ? buffer : buffer.slice(0, offset);
+        buffer = new Uint8Array(maxChunkLen), offset = 0;
+        write(chunk);
+    };
+    return (chunk) => {
+        if (isClosed || !chunk?.byteLength) return;
+        const data = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+        if (data.byteLength > (maxChunkLen >> 1)) {
+            flush();
+            return write(data);
+        }
+        let dataOffset = 0;
+        while (dataOffset < data.byteLength) {
+            const copyLen = Math.min(maxChunkLen - offset, data.byteLength - dataOffset);
+            buffer.set(data.subarray(dataOffset, dataOffset + copyLen), offset);
+            offset += copyLen, dataOffset += copyLen;
+            offset === maxChunkLen && flush();
+        }
+        offset > 0 && (timerId ||= setTimeout(flush, 1));
+    };
+};
 const handleSession = async (chunk, state, request, writable, close, isEarlyData = false) => {
     const allowNeedMore = state.allowNeedMore === true;
     if (allowNeedMore) state.needMore = false;
@@ -914,11 +947,12 @@ const handleSession = async (chunk, state, request, writable, close, isEarlyData
         state.tcpSocket = await establishTcpConnection(parsedRequest, request);
         if (!state.tcpSocket) return close();
         const tcpWriter = state.tcpSocket.writable.getWriter();
-        if (payload.byteLength) await tcpWriter.write(payload);
+        const bufferedTcpWriter = createBufferedTcpWriter(tcpWriter, close);
+        if (payload.byteLength) tcpWriter.write(payload);
         if (isSs || state.ssOutbound) {
             state.tcpWriter = async (c) => {
                 await ssAeadDecryptFeed(state.ssInbound, c instanceof Uint8Array ? c : new Uint8Array(c), async plain => {
-                    if (plain.byteLength) await tcpWriter.write(plain);
+                    if (plain.byteLength) bufferedTcpWriter(plain);
                 });
             };
             state.ssResponseSalt?.length && writable.send(state.ssResponseSalt);
@@ -941,7 +975,7 @@ const handleSession = async (chunk, state, request, writable, close, isEarlyData
                 } finally {await flushPromise}
             })();
         } else {
-            state.tcpWriter = (c) => tcpWriter.write(c);
+            state.tcpWriter = bufferedTcpWriter;
             if (state.tcpSocket.extra?.length) writable.send(state.tcpSocket.extra);
             manualPipe(state.tcpSocket.readable, writable, close);
         }

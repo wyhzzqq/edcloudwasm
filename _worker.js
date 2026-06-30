@@ -14,7 +14,7 @@ const ssAeadPassword = ''; // 可在环境变量配置，变量名称为SSPASS
 // ---------------------------------------------------------------------------------
 /** 缓冲区最大大小。*/
 /**- **警告**: 大小为maxChunkLen的整数倍使用率最高，不然会有空间浪费。*/
-const bufferSize = 512 * 1024;         // 512KB
+const bufferSize = 256 * 1024;         // 256KB
 /** 开启限速缓存模式的大包流量阈值。*/
 const startThreshold = 50 * 1024 * 1024; //50MB
 /** 从TCP读取的数据块最大大小，改小会成倍增加传输相同流量的cpu开销，同时会因为写满而增加数据进入缓冲区限速的概率*/
@@ -22,7 +22,7 @@ const startThreshold = 50 * 1024 * 1024; //50MB
 /**- **警告**: 免费worker设置64KB时传输相同流量cpu开销最低。*/
 const maxChunkLen = 64 * 1024;        // 64KB
 /** 进入缓冲模式时的缓冲区发送的触发时间。*/
-const flushTime = 10;                 // 10ms
+const flushTime = 4;                 // 4ms
 // ---------------------------------------------------------------------------------
 /** SS AEAD加密时每批并发处理的payload分片数量，length加密开销低，会随payload一起提交。*/
 const ssAeadEncryptCount = 4;
@@ -779,20 +779,25 @@ const establishTcpConnection = async (parsedRequest, request) => {
     return null;
 };
 const manualPipe = async (readable, writable, close) => {
-    const safeBufferSize = bufferSize - maxChunkLen, fastFlushOffset = Math.max((bufferSize / flushTime) << 1, maxChunkLen << 1);
+    const safeBufferSize = bufferSize - maxChunkLen, fastFlushOffset = maxChunkLen << 1;
     let buffer = new ArrayBuffer(bufferSize), spareBuffer = new ArrayBuffer(maxChunkLen), bufferView = new Uint8Array(buffer);
-    let offset = 0, totalBytes = 0, time = 0, timerId = null, resume = null, isReading = false, needsFlush = false, protectFlush = false;
+    let offset = 0, totalBytes = 0, time = 0, timerId = null, resume = null, isReading = false, needsFlush = false, protectFlush = false, flushDelayCount = 0;
     let isClose = false, fastFlush = true;
-    const flushBuffer = () => {
+    const flushBuffer = (force = false) => {
         if (isReading) return needsFlush = true;
         fastFlush = offset < fastFlushOffset;
+        if (!force && offset > 0 && offset < fastFlushOffset && !isClose && flushDelayCount < 1) {
+            flushDelayCount++, needsFlush = false;
+            timerId && clearTimeout(timerId), timerId = setTimeout(flushBuffer);
+            return;
+        }
         if (offset > 0 && !isClose) {
             offset > safeBufferSize
                 ? (writable.send(bufferView.subarray(0, offset)), buffer = new ArrayBuffer(bufferSize), bufferView = new Uint8Array(buffer))
                 : writable.send(bufferView.slice(0, offset));
             offset = 0;
         }
-        needsFlush = false, protectFlush = false, timerId && (clearTimeout(timerId), timerId = null), resume?.(), resume = null;
+        needsFlush = false, protectFlush = false, flushDelayCount = 0, timerId && (clearTimeout(timerId), timerId = null), resume?.(), resume = null;
     };
     const reader = readable.getReader({mode: 'byob'});
     try {
@@ -806,6 +811,10 @@ const manualPipe = async (readable, writable, close) => {
             useSpare ? (bufferView.set(value, offset), spareBuffer = value.buffer) : (buffer = value.buffer, bufferView = new Uint8Array(buffer));
             if (done) break;
             const chunkLen = value.byteLength;
+            if (!chunkLen) {
+                needsFlush && flushBuffer();
+                continue;
+            }
             offset += chunkLen;
             if (needsFlush) {
                 flushBuffer();
@@ -817,7 +826,7 @@ const manualPipe = async (readable, writable, close) => {
                 offset > safeBufferSize && (time === flushTime ? await new Promise(r => resume = r) : flushBuffer());
             }
         }
-    } catch {close?.(), isClose = true} finally {isReading = false, flushBuffer()}
+    } catch {close?.(), isClose = true} finally {isReading = false, flushBuffer(true)}
 };
 const createBufferedTcpWriter = (tcpWriter, close) => {
     const queue = new Array(4096);
